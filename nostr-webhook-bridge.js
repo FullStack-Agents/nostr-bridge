@@ -1,6 +1,6 @@
 import { SimplePool, nip04, nip19, getPublicKey, finalizeEvent, utils } from 'nostr-tools';
 import 'websocket-polyfill'; // Required for nostr-tools in Node.js
-import http from 'http';
+import { randomUUID } from 'crypto';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -25,12 +25,14 @@ const RELAYS = (process.env.NOSTR_RELAYS || 'wss://relay.damus.io,wss://nos.lol,
 // OpenClaw Inbound Webhook (Where we send messages FROM Nostr)
 const OPENCLAW_WEBHOOK_URL = process.env.OPENCLAW_WEBHOOK_URL || 'http://127.0.0.1:18789/nostr/agent';
 const OPENCLAW_WEBHOOK_TOKEN = process.env.OPENCLAW_WEBHOOK_TOKEN || 'YOUR_WEBHOOK_TOKEN';
-const OPENCLAW_SESSION_TARGET = process.env.OPENCLAW_SESSION_TARGET || 'isolated';
+const OPENCLAW_GATEWAY_BASE_URL = process.env.OPENCLAW_GATEWAY_BASE_URL || 'http://127.0.0.1:18789';
+const OPENCLAW_GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN;
+const OPENCLAW_POLL_INTERVAL_MS = Number.parseInt(process.env.OPENCLAW_POLL_INTERVAL_MS || '1500', 10);
+const OPENCLAW_POLL_TIMEOUT_MS = Number.parseInt(process.env.OPENCLAW_POLL_TIMEOUT_MS || '60000', 10);
 
-// Local Server Port (Where we receive replies FROM OpenClaw)
-const LOCAL_PORT = Number.parseInt(process.env.PORT || '4000', 10);
-const OPENCLAW_OUTBOUND_WEBHOOK_URL = process.env.OPENCLAW_OUTBOUND_WEBHOOK_URL
-  || `http://127.0.0.1:${LOCAL_PORT}/outbound`;
+if (!OPENCLAW_GATEWAY_TOKEN) {
+  throw new Error('OPENCLAW_GATEWAY_TOKEN is not set. Pass it in as the OPENCLAW_GATEWAY_TOKEN environment variable.');
+}
 
 // ==========================================
 // Initialization
@@ -112,8 +114,14 @@ async function handleNostrEvent(event) {
     
     console.log(`[INBOUND] Received DM from ${event.pubkey.substring(0, 8)}...: ${decryptedMessage}`);
 
-    // Forward to OpenClaw Webhook
-    await forwardToOpenClaw(event.pubkey, decryptedMessage);
+    // Forward to OpenClaw and wait for the assistant reply.
+    const replyText = await forwardToOpenClaw(event.pubkey, decryptedMessage);
+    if (!replyText) {
+      console.warn('[OUTBOUND] No assistant reply extracted from OpenClaw history');
+      return;
+    }
+
+    await sendNostrReply(event.pubkey, replyText);
     
   } catch (error) {
     console.error(`[INBOUND] Failed to process event ${event.id}:`, error.message);
@@ -121,19 +129,15 @@ async function handleNostrEvent(event) {
 }
 
 async function forwardToOpenClaw(senderPubkey, text) {
+  const requestId = randomUUID();
+  const sessionKey = `hook:nostr:${senderPubkey}:${requestId}`;
+
   try {
-    // Format payload for OpenClaw /nostr/agent endpoint
+    // Format payload for mapped OpenClaw /nostr/agent endpoint
     const payload = {
       message: text,
-      sessionTarget: OPENCLAW_SESSION_TARGET,
-      delivery: {
-        mode: 'webhook',
-        to: OPENCLAW_OUTBOUND_WEBHOOK_URL
-      },
-      metadata: {
-        source: 'nostr',
-        senderPubkey
-      }
+      senderPubkey,
+      requestId
     };
 
     const response = await fetch(OPENCLAW_WEBHOOK_URL, {
@@ -150,44 +154,85 @@ async function forwardToOpenClaw(senderPubkey, text) {
       throw new Error(`OpenClaw responded with ${response.status}: ${errorText}`);
     }
 
-    const responseBody = await response.text();
-    console.log(`[INBOUND] Successfully forwarded message to OpenClaw: ${responseBody}`);
+    const responseJson = await response.json();
+    console.log(`[INBOUND] OpenClaw run accepted (runId=${responseJson.runId || 'unknown'})`);
+
+    const replyText = await waitForOpenClawReply(sessionKey, responseJson.runId);
+    if (!replyText) {
+      throw new Error('Timed out waiting for assistant reply from OpenClaw');
+    }
+
+    return replyText;
     
   } catch (error) {
     console.error('[INBOUND] Failed to forward to OpenClaw:', error.message);
+    return null;
   }
 }
 
-function extractTargetPubkey(payload) {
-  const candidates = [
-    payload?.userId,
-    payload?.targetPubkey,
-    payload?.pubkey,
-    payload?.metadata?.senderPubkey,
-    payload?.metadata?.targetPubkey,
-    payload?.context?.senderPubkey,
-    payload?.context?.targetPubkey,
-    payload?.request?.metadata?.senderPubkey,
-    payload?.request?.metadata?.targetPubkey
-  ];
-
-  return candidates.find((value) => typeof value === 'string' && /^[a-fA-F0-9]{64}$/.test(value));
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function extractReplyText(payload) {
-  const candidates = [
-    payload?.text,
-    payload?.message,
-    payload?.reply,
-    payload?.output,
-    payload?.content,
-    payload?.result?.text,
-    payload?.result?.message,
-    payload?.data?.text,
-    payload?.data?.message
-  ];
+function extractTextFromContent(content) {
+  if (typeof content === 'string') {
+    const text = content.trim();
+    return text.length > 0 ? text : null;
+  }
 
-  return candidates.find((value) => typeof value === 'string' && value.trim().length > 0);
+  if (Array.isArray(content)) {
+    const parts = content
+      .map((part) => (typeof part?.text === 'string' ? part.text.trim() : ''))
+      .filter(Boolean);
+    return parts.length > 0 ? parts.join('\n') : null;
+  }
+
+  return null;
+}
+
+function extractLatestAssistantReply(historyPayload) {
+  const messages = Array.isArray(historyPayload?.messages)
+    ? historyPayload.messages
+    : Array.isArray(historyPayload?.items)
+      ? historyPayload.items
+      : [];
+
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const message = messages[i];
+    if (message?.role !== 'assistant') continue;
+
+    const text = extractTextFromContent(message?.content);
+    if (text) return text;
+  }
+
+  return null;
+}
+
+async function waitForOpenClawReply(sessionKey, runId) {
+  const deadline = Date.now() + OPENCLAW_POLL_TIMEOUT_MS;
+  const encodedSessionKey = encodeURIComponent(sessionKey);
+  const historyUrl = `${OPENCLAW_GATEWAY_BASE_URL}/sessions/${encodedSessionKey}/history?limit=100`;
+
+  while (Date.now() < deadline) {
+    const response = await fetch(historyUrl, {
+      headers: {
+        'Authorization': `Bearer ${OPENCLAW_GATEWAY_TOKEN}`
+      }
+    });
+
+    if (response.ok) {
+      const payload = await response.json();
+      const assistantReply = extractLatestAssistantReply(payload);
+      if (assistantReply) {
+        console.log(`[INBOUND] Retrieved OpenClaw reply for runId=${runId || 'unknown'}`);
+        return assistantReply;
+      }
+    }
+
+    await sleep(OPENCLAW_POLL_INTERVAL_MS);
+  }
+
+  return null;
 }
 
 // ==========================================
@@ -224,54 +269,4 @@ async function sendNostrReply(targetPubkey, text) {
   }
 }
 
-// Create a simple HTTP server to receive webhooks from OpenClaw
-const server = http.createServer((req, res) => {
-  if (req.method === 'POST' && req.url === '/outbound') {
-    let body = '';
-    
-    req.on('data', chunk => {
-      body += chunk.toString();
-    });
-    
-    req.on('end', async () => {
-      try {
-        const payload = JSON.parse(body);
-        
-        const targetPubkey = extractTargetPubkey(payload);
-        const replyText = extractReplyText(payload);
-
-        if (!targetPubkey || !replyText) {
-          res.writeHead(400);
-          res.end('Missing target pubkey or reply text');
-          return;
-        }
-
-        // Send the reply back to Nostr asynchronously
-        sendNostrReply(targetPubkey, replyText);
-
-        // Acknowledge receipt to OpenClaw immediately
-        res.writeHead(200);
-        res.end('OK');
-        
-      } catch (error) {
-        console.error('[OUTBOUND] Failed to parse OpenClaw webhook:', error.message);
-        res.writeHead(400);
-        res.end('Invalid JSON');
-      }
-    });
-  } else {
-    res.writeHead(404);
-    res.end('Not Found');
-  }
-});
-
-// ==========================================
-// Start Everything
-// ==========================================
-
 startNostrListener().catch(console.error);
-
-server.listen(LOCAL_PORT, () => {
-  console.log(`Local webhook server listening on port ${LOCAL_PORT} for OpenClaw replies`);
-  console.log(`Configured OpenClaw outbound webhook callback: ${OPENCLAW_OUTBOUND_WEBHOOK_URL}`);
-});
