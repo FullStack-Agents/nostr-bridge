@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "dotenv": "17.3.1",
-    "nostr-tools": "2.7.0",
-    "websocket-polyfill": "0.0.3"
+    "nostr-tools": "2.23.3",
+    "websocket-polyfill": "1.0.0"
   }
 }
