@@ -80,6 +80,7 @@ async function startNostrListener() {
     },
     {
       onevent(event) {
+        console.log('event received')
         handleNostrEvent(event);
       },
       oneose() {
