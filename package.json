@@ -1,0 +1,15 @@
+{
+  "name": "nostr-openclaw-bridge",
+  "version": "1.0.0",
+  "description": "A simple bridge to forward Nostr DMs to an OpenClaw webhook",
+  "main": "nostr-webhook-bridge.js",
+  "type": "module",
+  "scripts": {
+    "start": "node nostr-webhook-bridge.js"
+  },
+  "dependencies": {
+    "dotenv": "17.3.1",
+    "nostr-tools": "2.7.0",
+    "websocket-polyfill": "0.0.3"
+  }
+}
