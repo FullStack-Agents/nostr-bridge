@@ -129,7 +129,7 @@ async function handleNostrEvent(event) {
 }
 
 async function forwardToOpenClaw(senderPubkey, text) {
-  console.log('forwardToOpenClaw text: ', text);
+  console.log('ping01')
   const requestId = randomUUID();
   const sessionKey = `hook:nostr:${senderPubkey}:${requestId}`;
 
@@ -141,6 +141,7 @@ async function forwardToOpenClaw(senderPubkey, text) {
       requestId
     };
 
+    console.log('ping02')
     const response = await fetch(OPENCLAW_WEBHOOK_URL, {
       method: 'POST',
       headers: {
@@ -150,19 +151,20 @@ async function forwardToOpenClaw(senderPubkey, text) {
       body: JSON.stringify(payload)
     });
 
+    console.log('ping03')
     if (!response.ok) {
       const errorText = await response.text();
       throw new Error(`OpenClaw responded with ${response.status}: ${errorText}`);
     }
-
+    console.log('ping04')
     const responseJson = await response.json();
     console.log(`[INBOUND] OpenClaw run accepted (runId=${responseJson.runId || 'unknown'})`);
-
+    console.log('ping05')
     const replyText = await waitForOpenClawReply(sessionKey, responseJson.runId);
     if (!replyText) {
       throw new Error('Timed out waiting for assistant reply from OpenClaw');
     }
-
+    console.log('ping06')
     return replyText;
     
   } catch (error) {
