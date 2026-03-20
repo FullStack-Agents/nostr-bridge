@@ -129,6 +129,7 @@ async function handleNostrEvent(event) {
 }
 
 async function forwardToOpenClaw(senderPubkey, text) {
+  console.log('forwardToOpenClaw text: ', text);
   const requestId = randomUUID();
   const sessionKey = `hook:nostr:${senderPubkey}:${requestId}`;
 
