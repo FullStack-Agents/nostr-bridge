@@ -23,11 +23,14 @@ const RELAYS = (process.env.NOSTR_RELAYS || 'wss://relay.damus.io,wss://nos.lol,
   .filter(Boolean);
 
 // OpenClaw Inbound Webhook (Where we send messages FROM Nostr)
-const OPENCLAW_WEBHOOK_URL = process.env.OPENCLAW_WEBHOOK_URL || 'http://localhost:3000/api/webhook/YOUR_WEBHOOK_ID';
+const OPENCLAW_WEBHOOK_URL = process.env.OPENCLAW_WEBHOOK_URL || 'http://127.0.0.1:18789/nostr/agent';
 const OPENCLAW_WEBHOOK_TOKEN = process.env.OPENCLAW_WEBHOOK_TOKEN || 'YOUR_WEBHOOK_TOKEN';
+const OPENCLAW_SESSION_TARGET = process.env.OPENCLAW_SESSION_TARGET || 'isolated';
 
 // Local Server Port (Where we receive replies FROM OpenClaw)
 const LOCAL_PORT = Number.parseInt(process.env.PORT || '4000', 10);
+const OPENCLAW_OUTBOUND_WEBHOOK_URL = process.env.OPENCLAW_OUTBOUND_WEBHOOK_URL
+  || `http://127.0.0.1:${LOCAL_PORT}/outbound`;
 
 // ==========================================
 // Initialization
@@ -119,16 +122,17 @@ async function handleNostrEvent(event) {
 
 async function forwardToOpenClaw(senderPubkey, text) {
   try {
-    // Format the payload according to OpenClaw's generic webhook schema
+    // Format payload for OpenClaw /nostr/agent endpoint
     const payload = {
-      // The unique ID of the sender (so OpenClaw maintains session history per user)
-      userId: senderPubkey,
-      // The actual message text
-      text: text,
-      // Optional metadata you want OpenClaw to have
+      message: text,
+      sessionTarget: OPENCLAW_SESSION_TARGET,
+      delivery: {
+        mode: 'webhook',
+        to: OPENCLAW_OUTBOUND_WEBHOOK_URL
+      },
       metadata: {
         source: 'nostr',
-        originalPubkey: senderPubkey
+        senderPubkey
       }
     };
 
@@ -136,7 +140,7 @@ async function forwardToOpenClaw(senderPubkey, text) {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${OPENCLAW_WEBHOOK_TOKEN}`
+        'X-OpenClaw-Token': OPENCLAW_WEBHOOK_TOKEN
       },
       body: JSON.stringify(payload)
     });
@@ -146,11 +150,44 @@ async function forwardToOpenClaw(senderPubkey, text) {
       throw new Error(`OpenClaw responded with ${response.status}: ${errorText}`);
     }
 
-    console.log(`[INBOUND] Successfully forwarded message to OpenClaw`);
+    const responseBody = await response.text();
+    console.log(`[INBOUND] Successfully forwarded message to OpenClaw: ${responseBody}`);
     
   } catch (error) {
     console.error('[INBOUND] Failed to forward to OpenClaw:', error.message);
   }
+}
+
+function extractTargetPubkey(payload) {
+  const candidates = [
+    payload?.userId,
+    payload?.targetPubkey,
+    payload?.pubkey,
+    payload?.metadata?.senderPubkey,
+    payload?.metadata?.targetPubkey,
+    payload?.context?.senderPubkey,
+    payload?.context?.targetPubkey,
+    payload?.request?.metadata?.senderPubkey,
+    payload?.request?.metadata?.targetPubkey
+  ];
+
+  return candidates.find((value) => typeof value === 'string' && /^[a-fA-F0-9]{64}$/.test(value));
+}
+
+function extractReplyText(payload) {
+  const candidates = [
+    payload?.text,
+    payload?.message,
+    payload?.reply,
+    payload?.output,
+    payload?.content,
+    payload?.result?.text,
+    payload?.result?.message,
+    payload?.data?.text,
+    payload?.data?.message
+  ];
+
+  return candidates.find((value) => typeof value === 'string' && value.trim().length > 0);
 }
 
 // ==========================================
@@ -200,13 +237,12 @@ const server = http.createServer((req, res) => {
       try {
         const payload = JSON.parse(body);
         
-        // OpenClaw's outbound webhook payload will include the userId we sent earlier
-        const targetPubkey = payload.userId;
-        const replyText = payload.text;
+        const targetPubkey = extractTargetPubkey(payload);
+        const replyText = extractReplyText(payload);
 
         if (!targetPubkey || !replyText) {
           res.writeHead(400);
-          res.end('Missing userId or text');
+          res.end('Missing target pubkey or reply text');
           return;
         }
 
@@ -237,5 +273,5 @@ startNostrListener().catch(console.error);
 
 server.listen(LOCAL_PORT, () => {
   console.log(`Local webhook server listening on port ${LOCAL_PORT} for OpenClaw replies`);
-  console.log(`Configure OpenClaw to send outbound webhooks to: http://localhost:${LOCAL_PORT}/outbound`);
+  console.log(`Configured OpenClaw outbound webhook callback: ${OPENCLAW_OUTBOUND_WEBHOOK_URL}`);
 });
